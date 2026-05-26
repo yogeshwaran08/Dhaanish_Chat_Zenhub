@@ -97,7 +97,7 @@ export default function Topbar({ user, onLogout, onNavigate }) {
       >
         <img
           src="/forgemind-logo.gif"
-          alt="ForgeMind"
+          alt="Dhaanish Chat"
           style={{ height: 36, width: 36, objectFit: 'contain', flexShrink: 0 }}
           onError={e => { e.currentTarget.style.display = 'none'; }}
         />
@@ -114,7 +114,7 @@ export default function Topbar({ user, onLogout, onNavigate }) {
             alignItems: 'center',
             gap: 6,
           }}>
-            FORGE
+            DHAANISH
             <span style={{
               background: C.primary,
               color: '#fff',
@@ -132,7 +132,7 @@ export default function Topbar({ user, onLogout, onNavigate }) {
       {/* Right controls */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         {/* GitHub stars — opens this project's repo */}
-        <button
+        {/* <button
           onClick={() => window.open(GITHUB_REPO_URL, '_blank', 'noopener,noreferrer')}
           title="Star ForgeChat on GitHub"
           style={{
@@ -145,10 +145,10 @@ export default function Topbar({ user, onLogout, onNavigate }) {
           <Github size={16} color={C.headerText} />
           <Star size={14} color="#F5B400" fill="#F5B400" />
           <span style={{ minWidth: 8, textAlign: 'left' }}>{stars == null ? '—' : stars}</span>
-        </button>
+        </button> */}
 
         {/* About Us */}
-        <button
+        {/* <button
           onClick={() => onNavigate('about')}
           title="About Us"
           style={{
@@ -163,7 +163,7 @@ export default function Topbar({ user, onLogout, onNavigate }) {
             justifyContent: 'center',
           }}>
           <Info size={16} color={C.headerText} />
-        </button>
+        </button> */}
 
         {/* User avatar */}
         <div ref={ref} style={{ position: 'relative' }}>

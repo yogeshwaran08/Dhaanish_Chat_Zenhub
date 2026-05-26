@@ -1134,7 +1134,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
               <Field label="Latitude" style={{ flex:1 }}><Input value={dd.latitude || ""} onChange={e=>setDirect({latitude:e.target.value})} placeholder="12.97" style={{ padding:"6px 9px", fontSize:11 }}/></Field>
               <Field label="Longitude" style={{ flex:1 }}><Input value={dd.longitude || ""} onChange={e=>setDirect({longitude:e.target.value})} placeholder="80.21" style={{ padding:"6px 9px", fontSize:11 }}/></Field>
             </div>
-            <Field label="Location name (optional)"><VarInput value={dd.name || ""} onChange={e=>setDirect({name:e.target.value})} placeholder="e.g. Forge Realty HQ" style={{ padding:"6px 9px", fontSize:11 }}/></Field>
+            <Field label="Location name (optional)"><VarInput value={dd.name || ""} onChange={e=>setDirect({name:e.target.value})} placeholder="e.g. Dhaanish Realty HQ" style={{ padding:"6px 9px", fontSize:11 }}/></Field>
             <Field label="Address (optional)"><VarInput value={dd.address || ""} onChange={e=>setDirect({address:e.target.value})} placeholder="e.g. 123 Anna Nagar, Chennai" style={{ padding:"6px 9px", fontSize:11 }}/></Field>
           </>;
         case "contact":
@@ -1901,7 +1901,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
         icon: IC.qr, color: "#6A3FAF", bg: "#E8E0F8", border: "#B5A4DD",
         source: "wa", sourceLabel: "WhatsApp inbound message webhook",
         title: "QR code scan",
-        body: "Technically identical to a click-to-chat link — the QR encodes a wa.me URL with a pre-filled message that identifies the scan source. WhatsApp doesn't know it came from a QR; ForgeChat attributes it via the pre-filled text."
+        body: "Technically identical to a click-to-chat link — the QR encodes a wa.me URL with a pre-filled message that identifies the scan source. WhatsApp doesn't know it came from a QR; DHaanish Chat attributes it via the pre-filled text."
       },
       newContact: {
         icon: IC.user, color: C.purpleDark, bg: C.purpleBg, border: "#C7C2F4",
@@ -2329,7 +2329,7 @@ const SettingsPanel = ({ node, nodes=[], edges=[], onUpdateNode=()=>{}, onDelete
   else if (node.type==="ai") {
     const aiTask    = node.aiTask    || "lead_qualification";
     const aiGoal    = node.aiGoal    !== undefined ? node.aiGoal    : "Qualify the lead by asking about budget, timeline, and preferred area. Politely escalate to a human if the lead is hot.";
-    const aiContext = node.aiContext !== undefined ? node.aiContext : "We are Forge Realty, a Chennai-based real-estate agency. Our active inventory: 2BHK & 3BHK apartments in Anna Nagar (₹85L–₹1.2Cr), Adyar (₹1.4Cr–₹2.1Cr), and Velachery (₹70L–₹95L). Site visits Mon–Sat 11 AM – 6 PM. Token amount ₹50,000 (refundable).";
+    const aiContext = node.aiContext !== undefined ? node.aiContext : "We are Dhaanish Realty, a Chennai-based real-estate agency. Our active inventory: 2BHK & 3BHK apartments in Anna Nagar (₹85L–₹1.2Cr), Adyar (₹1.4Cr–₹2.1Cr), and Velachery (₹70L–₹95L). Site visits Mon–Sat 11 AM – 6 PM. Token amount ₹50,000 (refundable).";
     const aiSaveTo  = node.aiSaveTo  || "ai_summary";
     const aiFallback= node.aiFallback|| "fallback_message";
     const fallbackTemplateId = node.fallbackTemplateId || "";

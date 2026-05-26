@@ -68,7 +68,7 @@ export default function LoginGate({ onLogin }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 40 }}>
             <img
               src="/forgemind-logo.gif"
-              alt="ForgeMind Logo"
+              alt="Dhaanish Logo"
               style={{ height: 56, width: 56, objectFit: 'contain', flexShrink: 0 }}
               onError={e => { e.currentTarget.style.display = 'none'; }}
             />
@@ -79,7 +79,7 @@ export default function LoginGate({ onLogin }) {
                 letterSpacing: '-0.02em',
                 color: C.headerText,
               }}>
-                Forge<span style={{ color: C.primary }}>Chat</span>
+                Dhaanish<span style={{ color: C.primary }}>Chat</span>
               </div>
               <div style={{
                 fontSize: 11,
@@ -116,7 +116,7 @@ export default function LoginGate({ onLogin }) {
         </div>
 
         <a
-          href="https://forgemind.in/"
+          href="https://dhaanishchennai.in/"
           target="_blank"
           rel="noopener noreferrer"
           style={{
@@ -132,7 +132,7 @@ export default function LoginGate({ onLogin }) {
             cursor: 'pointer',
           }}
         >
-          FORGEMIND <span style={{ color: C.primary }}>AI</span>
+          Dhaanish <span style={{ color: C.primary }}>Chat</span>
         </a>
       </div>
 
@@ -189,7 +189,7 @@ export default function LoginGate({ onLogin }) {
               </div>
               <input
                 type="email"
-                placeholder="admin@forgemind.space"
+                placeholder="admin@dhaanishchennai.com"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 autoFocus
