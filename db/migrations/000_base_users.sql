@@ -9,6 +9,8 @@
 -- Definition is kept in sync with auth.js. CREATE TABLE IF NOT EXISTS makes this
 -- a no-op on existing deployments where the app already created the table.
 
+CREATE SCHEMA IF NOT EXISTS coexistence;
+
 CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
   id           BIGSERIAL PRIMARY KEY,
   username     TEXT NOT NULL UNIQUE,

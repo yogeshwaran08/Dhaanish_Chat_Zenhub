@@ -60,6 +60,7 @@ const router = Router();
 async function ensureTables() {
   const client = await pool.connect();
   try {
+    await client.query(`CREATE SCHEMA IF NOT EXISTS coexistence`);
     await client.query(`
       CREATE TABLE IF NOT EXISTS coexistence.forgecrm_users (
         id         BIGSERIAL PRIMARY KEY,
