@@ -7,12 +7,11 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY backend/package.json backend/package-lock.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY backend/src/ ./src/
-COPY backend/scripts/ ./scripts/
-COPY db/migrations/ ./db/migrations/
+COPY src/ ./src/
+COPY scripts/ ./scripts/
 
 ENV NODE_ENV=production
 EXPOSE 3011
