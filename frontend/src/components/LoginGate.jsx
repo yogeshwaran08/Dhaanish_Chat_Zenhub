@@ -51,7 +51,7 @@ export default function LoginGate({ onLogin }) {
           right: '-10%',
           width: '60%',
           height: '60%',
-          background: 'radial-gradient(circle, rgba(220,38,38,0.15) 0%, transparent 70%)',
+          background: 'radial-gradient(circle, rgba(120,160,255,0.20) 0%, transparent 70%)',
           pointerEvents: 'none',
         }} />
         <div style={{
@@ -60,16 +60,16 @@ export default function LoginGate({ onLogin }) {
           left: '-10%',
           width: '50%',
           height: '50%',
-          background: 'radial-gradient(circle, rgba(83,74,183,0.12) 0%, transparent 70%)',
+          background: 'radial-gradient(circle, rgba(60,90,200,0.16) 0%, transparent 70%)',
           pointerEvents: 'none',
         }} />
 
         <div style={{ position: 'relative', zIndex: 1, maxWidth: 480 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 40 }}>
             <img
-              src="/forgemind-logo.gif"
+              src="/dhaanish-logo.jpg"
               alt="Dhaanish Logo"
-              style={{ height: 56, width: 56, objectFit: 'contain', flexShrink: 0 }}
+              style={{ height: 56, width: 56, objectFit: 'cover', borderRadius: 12, flexShrink: 0 }}
               onError={e => { e.currentTarget.style.display = 'none'; }}
             />
             <div style={{ lineHeight: 1.15 }}>
@@ -79,7 +79,7 @@ export default function LoginGate({ onLogin }) {
                 letterSpacing: '-0.02em',
                 color: C.headerText,
               }}>
-                Dhaanish<span style={{ color: C.primary }}>Chat</span>
+                Dhaanish<span style={{ color: '#93B4F5' }}>Chat</span>
               </div>
               <div style={{
                 fontSize: 11,
@@ -125,14 +125,14 @@ export default function LoginGate({ onLogin }) {
             left: 64,
             fontSize: 10,
             fontWeight: 600,
-            color: '#52525b',
+            color: 'rgba(245,245,242,0.55)',
             letterSpacing: '.06em',
             textTransform: 'uppercase',
             textDecoration: 'none',
             cursor: 'pointer',
           }}
         >
-          Dhaanish <span style={{ color: C.primary }}>Chat</span>
+          Dhaanish <span style={{ color: '#93B4F5' }}>Chat</span>
         </a>
       </div>
 

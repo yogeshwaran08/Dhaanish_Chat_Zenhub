@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Info, LogOut, User, Settings, AlertTriangle, Star, Github } from 'lucide-react';
+import { Info, LogOut, Settings, AlertTriangle, Star, Github } from 'lucide-react';
 import { C, FONT } from '../constants.js';
 import { api } from '../api.js';
 
@@ -96,9 +96,9 @@ export default function Topbar({ user, onLogout, onNavigate }) {
         }}
       >
         <img
-          src="/forgemind-logo.gif"
+          src="/dhaanish-logo.jpg"
           alt="Dhaanish Chat"
-          style={{ height: 36, width: 36, objectFit: 'contain', flexShrink: 0 }}
+          style={{ height: 36, width: 36, objectFit: 'cover', borderRadius: 8, flexShrink: 0 }}
           onError={e => { e.currentTarget.style.display = 'none'; }}
         />
         <div style={{ lineHeight: 1.1 }}>
@@ -116,8 +116,8 @@ export default function Topbar({ user, onLogout, onNavigate }) {
           }}>
             DHAANISH
             <span style={{
-              background: C.primary,
-              color: '#fff',
+              background: '#fff',
+              color: C.primary,
               padding: '2px 7px',
               borderRadius: 6,
               lineHeight: 1.2,

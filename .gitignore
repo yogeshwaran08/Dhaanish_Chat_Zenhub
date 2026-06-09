@@ -10,6 +10,7 @@ build/
 *.tgz
 
 # Environment & secrets — NEVER commit
+.env
 .env.local
 .env.production
 .env.*.local
@@ -21,6 +22,10 @@ build/
 **/.admin-password
 
 # Runtime data (mounted as docker volumes in prod)
+backend/uploads/
+backend/media/
+uploads/
+media/
 
 # Logs
 *.log
@@ -56,14 +61,6 @@ scratch/
 /*.jsx
 transform.js
 
-# Local deployment compose — copy from docker-compose.sample.yml (gitignored so
-# each deployment keeps its own).
-docker-compose.yml
-
-# PDFs / large generated artifacts
-ForgeCRM_LLD.html
-*.pdf
-
 # Local AI-assistant / IDE scratch state (machine-specific, never commit)
 .claude/
 .CLAUDE.md
@@ -75,3 +72,5 @@ ForgeCRM_LLD.html
 *.dump
 *.sql.gz
 *.backup
+
+DEPLOY.md

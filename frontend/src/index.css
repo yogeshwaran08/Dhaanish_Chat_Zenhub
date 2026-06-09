@@ -29,7 +29,7 @@ input, button, textarea, select {
   --c-pageBg: #F7F7F3;
   --c-sidebarBg: #FAF9F5;
   --c-sidebarBorder: #E5E5E0;
-  --c-headerBg: #0F0F10;
+  --c-headerBg: #1E3A8A;
   --c-headerText: #F5F5F2;
   --c-headerMuted: #A1A1AA;
   --c-headerBorder: rgba(255,255,255,.12);
@@ -40,9 +40,9 @@ input, button, textarea, select {
   --c-text: #111111;
   --c-textSecondary: #6B7280;
   --c-textMuted: #8696a0;
-  --c-primary: #dc2626;
-  --c-primaryHover: #b91c1c;
-  --c-primaryLight: #FCEBEB;
+  --c-primary: #1E3A8A;
+  --c-primaryHover: #16306E;
+  --c-primaryLight: #E8EDF9;
   --c-primaryText: #111b21;
   --c-purple: #534AB7;
   --c-green: #0F6E56;
