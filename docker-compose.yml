@@ -48,6 +48,36 @@ services:
     networks:
       - forgecrm
 
+  google_migrations:
+    image: postgres:16-alpine
+    container_name: forgecrm-google-migrations
+    restart: "no"
+    env_file:
+      - ./backend/.env
+    depends_on:
+      postgres:
+        condition: service_started
+    volumes:
+      - ./db/migrations:/migrations:ro
+    command:
+      - sh
+      - -lc
+      - |
+        export PGPASSWORD="$POSTGRES_PASSWORD"
+        for file in \
+          /migrations/050_oauth_credentials.sql \
+          /migrations/051_agents.sql \
+          /migrations/052_agents_use_ai_models.sql \
+          /migrations/053_agent_triggers_media.sql \
+          /migrations/054_agent_transcribe_audio.sql \
+          /migrations/055_google_oauth_credentials.sql
+        do
+          echo "Applying: $file"
+          psql -v ON_ERROR_STOP=1 -h postgres -U postgres -d postgres -f "$file"
+        done
+    networks:
+      - forgecrm
+
   postgres:
     image: postgres:16-alpine
     container_name: forgecrm-db
