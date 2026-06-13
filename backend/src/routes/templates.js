@@ -308,6 +308,31 @@ router.put('/templates/:id', requirePermission('template-builder'), async (req, 
         editPayload.category = data.category;
       }
 
+      // Meta header_handles are SINGLE-USE — the one stored at create/last-edit
+      // time was already consumed, so reusing it makes Meta reject the edit with
+      // code 100 ("Invalid parameter", subcode 2388124). Re-mint a fresh handle
+      // from the linked Media Library asset right before sending the edit.
+      const editHeaderType = data.header_type || tpl.header_type || 'NONE';
+      const mediaLibId = data.header_media_library_id || tpl.header_media_library_id;
+      if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(editHeaderType) && mediaLibId) {
+        const headerComp = editPayload.components.find(c => c.type === 'HEADER');
+        if (headerComp) {
+          try {
+            const { handle } = await mintLibraryHeaderHandle({
+              accountId: tpl.whatsapp_account_id,
+              mediaLibraryId: mediaLibId,
+            });
+            headerComp.example = { header_handle: [handle] };
+          } catch (err) {
+            await client.query('ROLLBACK');
+            return res.status(err.status === 401 ? 401 : (err.status || 400)).json({
+              error: `Couldn't refresh the header media for Meta: ${err.message}`,
+              metaCode: err.metaError?.code,
+            });
+          }
+        }
+      }
+
       try {
         metaResponse = await metaEditTemplate(tpl.meta_template_id, account.accessToken, editPayload);
         await markAccountHealth(account.id, 'healthy');
@@ -316,8 +341,15 @@ router.put('/templates/:id', requirePermission('template-builder'), async (req, 
         await client.query('ROLLBACK');
         const isAuth = err.status === 401 || err.metaError?.code === 190;
         await markAccountHealth(account.id, isAuth ? 'invalid_token' : 'unknown_error', err.message).catch(() => {});
+        // Surface Meta's specific reason (error_user_title/msg, error_data.details)
+        // instead of the generic top-level "Invalid parameter" — mirrors the
+        // submit handler so edit failures are actually diagnosable.
+        const mErr = err.metaError || {};
+        const human = mErr.error_user_title
+          ? `${mErr.error_user_title}${mErr.error_user_msg ? ' — ' + mErr.error_user_msg : ''}`
+          : (mErr.error_user_msg || mErr.error_data?.details || mErr.message || err.message || 'Meta API error');
         return res.status(err.status === 401 ? 401 : 400).json({
-          error: err.metaError?.message || 'Meta API error',
+          error: human,
           metaCode: err.metaError?.code,
           metaErrorSubcode: err.metaError?.error_subcode,
           metaErrorData: err.metaError?.error_data,
@@ -906,14 +938,68 @@ router.post('/templates/upload-media-handle', requirePermission('template-builde
 });
 
 /**
+ * Mint a fresh, single-use Meta `header_handle` by re-uploading a Media Library
+ * asset through the resumable upload API. Returns the handle plus metadata.
+ *
+ * Meta consumes a header_handle when a template is created OR edited, so the
+ * handle stored on the template is already spent — any later edit must mint a
+ * new one. Used by both the convenience endpoint below and the approved-edit
+ * path in PUT /templates/:id. Throws Errors carrying `.status` (and `.metaError`
+ * for Meta failures) so callers can map them to HTTP responses.
+ */
+async function mintLibraryHeaderHandle({ accountId, mediaLibraryId }) {
+  const { rows: accRows } = await pool.query(
+    'SELECT * FROM coexistence.whatsapp_accounts WHERE id = $1', [accountId]
+  );
+  if (!accRows.length) { const e = new Error('WhatsApp account not found'); e.status = 404; throw e; }
+  const acc = accRows[0];
+  if (!acc.meta_app_id) {
+    const e = new Error('WhatsApp account is missing meta_app_id — add it in Settings → WhatsApp Accounts');
+    e.status = 400; throw e;
+  }
+
+  const { rows: mRows } = await pool.query(
+    `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`, [mediaLibraryId]
+  );
+  if (!mRows.length) { const e = new Error('Media not found in library'); e.status = 404; throw e; }
+  const media = mRows[0];
+
+  const { decrypt } = require('../util/crypto');
+  const accessToken = decrypt(acc.access_token_encrypted);
+  if (!accessToken) { const e = new Error('Account has no access token'); e.status = 400; throw e; }
+
+  const headerMime = canonicalizeMime(media.mime_type, media.original_name);
+  if (!isTemplateHeaderMime(headerMime)) {
+    const e = new Error(`"${media.original_name || 'This file'}" (${media.mime_type || 'unknown'}) can't be a template header. ${TEMPLATE_TYPES_MSG}`);
+    e.status = 400; throw e;
+  }
+
+  const storage = require('../util/pgStorage');
+  let buffer;
+  try {
+    buffer = await storage.getObjectBuffer(media.storage_key);
+  } catch (err) {
+    const e = new Error(`Failed to read media from storage: ${err.message}`); e.status = 502; throw e;
+  }
+
+  const handle = await uploadTemplateMediaHandle({
+    appId: acc.meta_app_id, accessToken, buffer, mimeType: headerMime,
+  });
+  await markAccountHealth(acc.id, 'healthy').catch(() => {});
+  return {
+    handle, mimeType: headerMime, size: Number(media.size_bytes),
+    name: media.name, originalName: media.original_name, mediaLibraryId: Number(media.id),
+  };
+}
+
+/**
  * POST /templates/upload-media-handle-from-library
  * Body: { accountId, mediaLibraryId }
  *
  * Same outcome as /templates/upload-media-handle, but pulls the source bytes
  * from the Media Library (Postgres storage) instead of an inline multipart upload.
- * The template `header_handle` is single-use at submit time, so we don't
- * persist anything per-WABA for templates — this is purely a convenience
- * that lets users build templates from previously uploaded library assets.
+ * Purely a convenience that lets users build templates from previously uploaded
+ * library assets — the actual minting is shared via mintLibraryHeaderHandle().
  */
 router.post('/templates/upload-media-handle-from-library', requirePermission('template-builder'), async (req, res) => {
   try {
@@ -921,59 +1007,16 @@ router.post('/templates/upload-media-handle-from-library', requirePermission('te
     if (!accountId || !mediaLibraryId) {
       return res.status(400).json({ error: 'accountId and mediaLibraryId required' });
     }
-
-    const { rows: accRows } = await pool.query(
-      'SELECT * FROM coexistence.whatsapp_accounts WHERE id = $1',
-      [accountId]
-    );
-    if (!accRows.length) return res.status(404).json({ error: 'WhatsApp account not found' });
-    const acc = accRows[0];
-    if (!acc.meta_app_id) {
-      return res.status(400).json({ error: 'WhatsApp account is missing meta_app_id — add it in Settings → WhatsApp Accounts' });
-    }
-
-    const { rows: mRows } = await pool.query(
-      `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
-      [mediaLibraryId]
-    );
-    if (!mRows.length) return res.status(404).json({ error: 'Media not found in library' });
-    const media = mRows[0];
-
-    const { decrypt } = require('../util/crypto');
-    const accessToken = decrypt(acc.access_token_encrypted);
-    if (!accessToken) return res.status(400).json({ error: 'Account has no access token' });
-
-    const headerMime = canonicalizeMime(media.mime_type, media.original_name);
-    if (!isTemplateHeaderMime(headerMime)) {
-      return res.status(400).json({ error: `"${media.original_name || 'This file'}" (${media.mime_type || 'unknown'}) can't be a template header. ${TEMPLATE_TYPES_MSG}` });
-    }
-
-    const storage = require('../util/pgStorage');
-    let buffer;
     try {
-      buffer = await storage.getObjectBuffer(media.storage_key);
+      const result = await mintLibraryHeaderHandle({ accountId, mediaLibraryId });
+      res.json(result);
     } catch (err) {
-      return res.status(502).json({ error: `Failed to read media from storage: ${err.message}` });
-    }
-
-    try {
-      const handle = await uploadTemplateMediaHandle({
-        appId: acc.meta_app_id, accessToken,
-        buffer, mimeType: headerMime,
-      });
-      await markAccountHealth(acc.id, 'healthy');
-      res.json({
-        handle,
-        mimeType: headerMime,
-        size: Number(media.size_bytes),
-        name: media.name,
-        originalName: media.original_name,
-        mediaLibraryId: Number(media.id),
-      });
-    } catch (err) {
-      const { classifyMetaError } = require('../services/accountHealth');
-      await markAccountHealth(acc.id, classifyMetaError(err), err.message);
-      return res.status(err.status === 401 ? 401 : 400).json({ error: err.message, metaCode: err.metaError?.code });
+      if (err.metaError) {
+        const { classifyMetaError } = require('../services/accountHealth');
+        await markAccountHealth(accountId, classifyMetaError(err), err.message).catch(() => {});
+        return res.status(err.status === 401 ? 401 : 400).json({ error: err.message, metaCode: err.metaError?.code });
+      }
+      return res.status(err.status || 400).json({ error: err.message });
     }
   } catch (err) {
     console.error('[templates] upload-media-handle-from-library error:', err.message);
