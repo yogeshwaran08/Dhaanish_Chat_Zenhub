@@ -79,7 +79,7 @@ export default function AboutUsPage() {
       </div>
 
       <div style={{ textAlign: 'center', marginTop: 36, fontSize: 12, color: C.textMuted }}>
-        © {new Date().getFullYear()} Forgemind · Powered by FMOS
+        © {new Date().getFullYear()} 
       </div>
     </div>
   );

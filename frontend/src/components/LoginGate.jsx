@@ -89,7 +89,7 @@ export default function LoginGate({ onLogin }) {
                 textTransform: 'uppercase',
                 marginTop: 4,
               }}>
-                powered by FMOS
+                powered by ZenHub
               </div>
             </div>
           </div>

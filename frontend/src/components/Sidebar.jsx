@@ -128,7 +128,7 @@ export default function Sidebar({ activePage, onPageChange, collapsed, setCollap
               letterSpacing: '.06em',
               textTransform: 'uppercase',
             }}>
-              Powered by FMOS
+              Powered by ZenHub
             </span>
           </div>
         )}
@@ -142,7 +142,7 @@ export default function Sidebar({ activePage, onPageChange, collapsed, setCollap
               letterSpacing: '.04em',
               textTransform: 'uppercase',
             }}>
-              FMOS
+              
             </span>
           </div>
         )}
