@@ -57,10 +57,20 @@ export const api = {
   importContactsTemplateUrl: () => '/api/contacts/import/template',
   // Bulk-import contacts from a .csv/.xlsx file. Uses raw fetch + FormData so the
   // browser sets the multipart boundary (the shared req() helper forces JSON).
-  importContacts: (waNumber, file) => {
+  // `tagSelection` optionally files every imported contact under a tag — either
+  // an existing one ({ tagId }) or a new one ({ newTagName, categoryId } or
+  // { newTagName, newCategoryName, tagColor }).
+  importContacts: (waNumber, file, tagSelection) => {
     const form = new FormData();
     form.append('waNumber', waNumber);
     form.append('file', file);
+    if (tagSelection?.tagId) form.append('tagId', tagSelection.tagId);
+    if (tagSelection?.newTagName) {
+      form.append('newTagName', tagSelection.newTagName);
+      if (tagSelection.categoryId) form.append('categoryId', tagSelection.categoryId);
+      if (tagSelection.newCategoryName) form.append('newCategoryName', tagSelection.newCategoryName);
+      if (tagSelection.tagColor) form.append('tagColor', tagSelection.tagColor);
+    }
     return fetch('/api/contacts/import', { method: 'POST', credentials: 'include', body: form })
       .then(async res => {
         if (!res.ok) {
@@ -124,12 +134,18 @@ export const api = {
   },
   broadcasts: {
     list: (status) => req(`/broadcasts${status && status !== 'all' ? `?status=${status}` : ''}`),
+    // Unfiltered counts per status, for the list view's filter-tab badges —
+    // independent of whatever status the table itself is currently filtered to.
+    counts: () => req('/broadcasts/counts'),
     get: (id) => req(`/broadcasts/${id}`),
     create: (data) => req('/broadcasts', { method: 'POST', body: JSON.stringify(data) }),
     update: (id, data) => req(`/broadcasts/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
     delete: (id) => req(`/broadcasts/${id}`, { method: 'DELETE' }),
     send: (id) => req(`/broadcasts/${id}/send`, { method: 'POST' }),
     test: (id, testNumber) => req(`/broadcasts/${id}/test`, { method: 'POST', body: JSON.stringify({ test_number: testNumber }) }),
+    recipients: (id) => req(`/broadcasts/${id}/recipients`),
+    retryRecipient: (id, logId) => req(`/broadcasts/${id}/recipients/${logId}/retry`, { method: 'POST' }),
+    retryFailed: (id) => req(`/broadcasts/${id}/retry-failed`, { method: 'POST' }),
   },
   chatbots: {
     list: () => req('/chatbots'),

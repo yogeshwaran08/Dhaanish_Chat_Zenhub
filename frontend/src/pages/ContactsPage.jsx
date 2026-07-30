@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Users, Search, Phone, User, Pencil, Trash2, Loader2, X, Send, Play, Music, FileText, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, Download } from 'lucide-react';
+import { Users, Search, Phone, User, Pencil, Trash2, Loader2, X, Send, Play, Music, FileText, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle, Download, Tag, Plus } from 'lucide-react';
 import DeleteConfirmModal from '../components/DeleteConfirmModal.jsx';
 import WhatsAppPreview, { BroadcastMessagePreview } from '../components/WhatsAppPreview.jsx';
 import TagMultiSelect from '../components/TagMultiSelect.jsx';
@@ -10,6 +10,13 @@ import MaskedNumber from '../components/MaskedNumber.jsx';
 import SearchableSelect from '../components/SearchableSelect.jsx';
 
 const ROLE_LABEL_MAP = { admin: 'Admin', bda_sales: 'Sales', viewer: 'Viewer' };
+
+// Preset swatches for the "new tag" color picker (mirrors Admin Settings → Tags).
+const COLOR_PRESETS = [
+  '#dc2626', '#ea580c', '#d97706', '#16a34a',
+  '#0891b2', '#2563eb', '#7c3aed', '#db2777',
+  '#4b5563', '#000000',
+];
 
 function TagBadge({ tag, onRemove }) {
   return (
@@ -85,6 +92,14 @@ export default function ContactsPage({ user, onNavigate }) {
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState(null); // { ok, imported, updated, skipped:[], total }
   const [importError, setImportError] = useState('');
+  // Tag every imported contact under — 'none' | 'existing' | 'new'
+  const [importTagMode, setImportTagMode] = useState('none');
+  const [importTagId, setImportTagId] = useState('');
+  const [importNewTagName, setImportNewTagName] = useState('');
+  const [importNewTagColor, setImportNewTagColor] = useState('#dc2626');
+  const [importCategoryMode, setImportCategoryMode] = useState('existing'); // 'existing' | 'new'
+  const [importCategoryId, setImportCategoryId] = useState('');
+  const [importNewCategoryName, setImportNewCategoryName] = useState('');
 
   // Load numbers on mount
   useEffect(() => {
@@ -119,7 +134,7 @@ export default function ContactsPage({ user, onNavigate }) {
   }, [selectedNumber, loadContacts]);
 
   // Load categories, tags, and team members
-  useEffect(() => {
+  const loadTagData = useCallback(() => {
     Promise.all([
       api.categories.list().catch(() => []),
       api.tags.list().catch(() => []),
@@ -129,19 +144,33 @@ export default function ContactsPage({ user, onNavigate }) {
       setTags(tgs);
       setFieldDefs(flds);
     });
+  }, []);
+
+  useEffect(() => {
+    loadTagData();
     // Admins can assign contacts to other users — load the assignable list.
     if (user?.role === 'admin') {
       api.users.list().then(setUsers).catch(() => setUsers([]));
     }
-  }, [user]);
+  }, [user, loadTagData]);
 
   // ── Import contacts ──────────────────────────────────────────────────────
   const ACCEPTED_IMPORT = ['.csv', '.xlsx'];
   const isAcceptedSheet = (file) =>
     !!file && ACCEPTED_IMPORT.some(ext => file.name.toLowerCase().endsWith(ext));
 
-  const openImport = () => { setImportFile(null); setImportResult(null); setImportError(''); setImportModal(true); };
-  const closeImport = () => { setImportModal(false); setImportFile(null); setImportResult(null); setImportError(''); };
+  const resetImportTagFields = () => {
+    setImportTagMode('none');
+    setImportTagId('');
+    setImportNewTagName('');
+    setImportNewTagColor('#dc2626');
+    setImportCategoryMode('existing');
+    setImportCategoryId('');
+    setImportNewCategoryName('');
+  };
+
+  const openImport = () => { setImportFile(null); setImportResult(null); setImportError(''); resetImportTagFields(); setImportModal(true); };
+  const closeImport = () => { setImportModal(false); setImportFile(null); setImportResult(null); setImportError(''); resetImportTagFields(); };
 
   const pickImportFile = (file) => {
     if (!file) return;
@@ -149,13 +178,43 @@ export default function ContactsPage({ user, onNavigate }) {
     setImportError(''); setImportResult(null); setImportFile(file);
   };
 
+  // Whether the current tag-selection state is complete enough to submit.
+  // Tagging is optional ('none' is always valid); 'existing'/'new' need their
+  // required fields filled in before the import can run.
+  const isImportTagSelectionValid = () => {
+    if (importTagMode === 'none') return true;
+    if (importTagMode === 'existing') return !!importTagId;
+    if (importTagMode === 'new') {
+      if (!importNewTagName.trim()) return false;
+      return importCategoryMode === 'existing' ? !!importCategoryId : !!importNewCategoryName.trim();
+    }
+    return true;
+  };
+
   const runImport = async () => {
     if (!importFile || !selectedNumber) return;
+    if (!isImportTagSelectionValid()) {
+      setImportError('Finish the tag selection (or switch to "No tag") before importing.');
+      return;
+    }
     setImporting(true); setImportError('');
     try {
-      const res = await api.importContacts(selectedNumber, importFile);
+      let tagSelection;
+      if (importTagMode === 'existing') {
+        tagSelection = { tagId: importTagId };
+      } else if (importTagMode === 'new') {
+        tagSelection = {
+          newTagName: importNewTagName.trim(),
+          tagColor: importNewTagColor,
+          ...(importCategoryMode === 'existing'
+            ? { categoryId: importCategoryId }
+            : { newCategoryName: importNewCategoryName.trim() }),
+        };
+      }
+      const res = await api.importContacts(selectedNumber, importFile, tagSelection);
       setImportResult(res);
       loadContacts(true); // refresh the list after import
+      if (importTagMode === 'new') loadTagData(); // a new tag/category may have been created
     } catch (err) {
       setImportError(err.message || 'Import failed. Please try again.');
     } finally {
@@ -798,6 +857,139 @@ export default function ContactsPage({ user, onNavigate }) {
                       </>
                     )}
                   </label>
+
+                  {/* ---- Tag selection (optional) ---- */}
+                  <div style={{ marginTop: 18 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
+                      <Tag size={13} /> Tag these contacts (optional)
+                    </div>
+
+                    <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                      {[
+                        { value: 'none', label: 'No tag' },
+                        { value: 'existing', label: 'Existing tag' },
+                        { value: 'new', label: 'New tag' },
+                      ].map(opt => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setImportTagMode(opt.value)}
+                          style={{
+                            flex: 1, padding: '8px 10px', borderRadius: 8,
+                            border: `1.5px solid ${importTagMode === opt.value ? C.primary : C.border}`,
+                            background: importTagMode === opt.value ? C.primaryLight : 'var(--c-cardBg)',
+                            color: importTagMode === opt.value ? C.primary : C.textSecondary,
+                            cursor: 'pointer', fontSize: 12.5, fontWeight: 700, fontFamily: FONT,
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {importTagMode === 'existing' && (
+                      <div>
+                        <SearchableSelect
+                          value={importTagId}
+                          onChange={(val) => setImportTagId(val)}
+                          options={tags.map(t => ({
+                            value: String(t.id),
+                            label: t.name,
+                            sublabel: categories.find(c => c.id === t.category_id)?.name || '',
+                          }))}
+                          placeholder="Select a tag…"
+                          searchPlaceholder="Search tags…"
+                          emptyText="No tags yet — switch to “New tag” to create one"
+                        />
+                      </div>
+                    )}
+
+                    {importTagMode === 'new' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                        <input
+                          value={importNewTagName}
+                          onChange={e => setImportNewTagName(e.target.value)}
+                          placeholder="New tag name, e.g. Follow-up"
+                          style={{
+                            width: '100%', padding: '9px 12px', borderRadius: 8,
+                            border: `1px solid ${C.border}`, fontSize: 13, fontFamily: FONT,
+                            color: C.text, outline: 'none', boxSizing: 'border-box',
+                          }}
+                        />
+
+                        <div>
+                          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                            {COLOR_PRESETS.map(c => (
+                              <button
+                                key={c}
+                                type="button"
+                                onClick={() => setImportNewTagColor(c)}
+                                style={{
+                                  width: 24, height: 24, borderRadius: 6, background: c,
+                                  border: importNewTagColor === c ? '2px solid #111' : '2px solid transparent',
+                                  boxShadow: importNewTagColor === c ? '0 0 0 2px #fff inset' : 'none',
+                                  cursor: 'pointer',
+                                }}
+                              />
+                            ))}
+                            <label style={{
+                              width: 24, height: 24, borderRadius: 6, position: 'relative',
+                              border: `2px dashed ${C.border}`, display: 'flex', alignItems: 'center',
+                              justifyContent: 'center', cursor: 'pointer', color: C.textMuted,
+                            }}>
+                              <Plus size={12} />
+                              <input type="color" value={importNewTagColor} onChange={e => setImportNewTagColor(e.target.value)} style={{ position: 'absolute', opacity: 0, width: 0, height: 0 }} />
+                            </label>
+                          </div>
+                        </div>
+
+                        {importCategoryMode === 'existing' ? (
+                          <div>
+                            <SearchableSelect
+                              value={importCategoryId}
+                              onChange={(val) => setImportCategoryId(val)}
+                              options={categories.map(c => ({ value: String(c.id), label: c.name }))}
+                              placeholder="Select a category…"
+                              searchPlaceholder="Search categories…"
+                              emptyText="No categories yet"
+                              createLabel="Create new category"
+                              onCreate={() => { setImportCategoryMode('new'); setImportCategoryId(''); }}
+                            />
+                          </div>
+                        ) : (
+                          <div>
+                            <div style={{ display: 'flex', gap: 8 }}>
+                              <input
+                                autoFocus
+                                value={importNewCategoryName}
+                                onChange={e => setImportNewCategoryName(e.target.value)}
+                                placeholder="New category name, e.g. Admission"
+                                style={{
+                                  flex: 1, padding: '9px 12px', borderRadius: 8,
+                                  border: `1px solid ${C.border}`, fontSize: 13, fontFamily: FONT,
+                                  color: C.text, outline: 'none', boxSizing: 'border-box',
+                                }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => { setImportCategoryMode('existing'); setImportNewCategoryName(''); }}
+                                style={{
+                                  padding: '9px 12px', borderRadius: 8, border: `1px solid ${C.border}`,
+                                  background: 'var(--c-cardBg)', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                                  color: C.textSecondary, fontFamily: FONT, whiteSpace: 'nowrap',
+                                }}
+                              >
+                                Use existing
+                              </button>
+                            </div>
+                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>
+                              This adds a new column to the Contacts table.
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
 
@@ -827,12 +1019,12 @@ export default function ContactsPage({ user, onNavigate }) {
                   </button>
                   <button
                     onClick={runImport}
-                    disabled={!importFile || importing}
+                    disabled={!importFile || importing || !isImportTagSelectionValid()}
                     style={{
                       display: 'inline-flex', alignItems: 'center', gap: 6,
                       padding: '9px 20px', borderRadius: 8, border: 'none',
-                      background: (!importFile || importing) ? '#ccc' : C.primary, color: '#fff',
-                      cursor: (!importFile || importing) ? 'not-allowed' : 'pointer',
+                      background: (!importFile || importing || !isImportTagSelectionValid()) ? '#ccc' : C.primary, color: '#fff',
+                      cursor: (!importFile || importing || !isImportTagSelectionValid()) ? 'not-allowed' : 'pointer',
                       fontSize: 13, fontWeight: 700, fontFamily: FONT,
                     }}
                   >

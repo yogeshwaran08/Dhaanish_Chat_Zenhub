@@ -23,6 +23,62 @@ async function loadContactContext(numbers) {
   return map;
 }
 
+// Resolve the media id for media-type broadcasts AND for template broadcasts
+// whose template has a media header (IMAGE/VIDEO/DOCUMENT) — both pull from
+// broadcast.media_library_id, falling back to the template's own header image
+// (message_templates.header_media_library_id) when the campaign didn't pick a
+// separate asset. Shared by /send, /test and the per-recipient /retry route so
+// the three don't drift out of sync.
+async function resolveHeaderMedia({ broadcast, template, account }) {
+  const tplHeaderType = template ? String(template.header_type || '').toUpperCase() : '';
+  const needsHeaderMedia = broadcast.message_type === 'template' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(tplHeaderType);
+  const headerMediaLibId = broadcast.media_library_id || (template && template.header_media_library_id) || null;
+  if (!((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || needsHeaderMedia) && headerMediaLibId)) {
+    return null;
+  }
+  const { syncMediaToAccount } = require('./mediaLibrary');
+  const { rows: mRows } = await pool.query(
+    `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
+    [headerMediaLibId]
+  );
+  if (!mRows.length) return null;
+  const media = mRows[0];
+  const { rows: sRows } = await pool.query(
+    `SELECT * FROM coexistence.media_meta_sync WHERE media_id = $1 AND account_id = $2`,
+    [media.id, account.id]
+  );
+  let sync = sRows[0];
+  const needsSync = !sync || sync.status !== 'synced' || !sync.meta_media_id || (sync.expires_at && new Date(sync.expires_at) <= new Date());
+  if (needsSync) {
+    sync = await syncMediaToAccount(media.id, account.id);
+    sync = { meta_media_id: sync.metaMediaId, expires_at: sync.expiresAt, status: sync.status };
+  }
+  return sync.meta_media_id;
+}
+
+// Load a broadcast + its joined template, in the shape /send, /test and /retry
+// all need (template columns t_-prefixed to disambiguate from the broadcast's
+// own columns of the same name).
+async function loadBroadcastWithTemplate(id) {
+  const { rows: bRows } = await pool.query(
+    `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
+            t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples,
+            t.header_media_library_id AS t_header_media_library_id
+       FROM coexistence.broadcasts b
+       LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
+      WHERE b.id = $1`,
+    [id]
+  );
+  if (bRows.length === 0) return null;
+  const broadcast = bRows[0];
+  const template = broadcast.message_type === 'template'
+    ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
+        header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples,
+        header_media_library_id: broadcast.t_header_media_library_id }
+    : null;
+  return { broadcast, template };
+}
+
 async function enqueueBroadcastRecipient({ broadcast, template, account, recipient, broadcastLogId, resolvedMediaId }) {
   const msgType = broadcast.message_type || 'template';
 
@@ -199,12 +255,63 @@ async function getBroadcastWithLogs(id) {
         COUNT(*) FILTER (WHERE bl.status = 'failed')::int AS failed,
         COUNT(*) FILTER (WHERE ch.status IN ('sent','delivered','read'))::int AS sent,
         COUNT(*) FILTER (WHERE ch.status IN ('delivered','read'))::int AS delivered,
-        COUNT(*) FILTER (WHERE ch.status = 'read')::int AS read
+        COUNT(*) FILTER (WHERE ch.status = 'read')::int AS read,
+        MIN(bl.sent_at) AS first_sent_at
        FROM coexistence.broadcast_logs bl
        LEFT JOIN coexistence.chat_history ch ON ch.message_id = bl.wa_message_id
       WHERE bl.broadcast_id = $1 AND bl.action = 'BROADCAST'`,
     [id]
   );
+
+  // "Replied" = the recipient sent an inbound message back after we messaged
+  // them. Deliberately a SEPARATE query joining two pre-aggregated sets rather
+  // than an EXISTS inside COUNT(...) FILTER: the latter can't be pulled up into
+  // a semi-join, so it re-scans chat_history once per recipient — and this
+  // endpoint is polled every 4s while a campaign is open. This form scans the
+  // inbound side once, bounded to messages newer than the campaign's first send.
+  const { rows: repliedRows } = await pool.query(
+    `WITH logs AS (
+       SELECT regexp_replace(sent_to, '\\D', '', 'g') AS num, MIN(sent_at) AS sent_at
+         FROM coexistence.broadcast_logs
+        WHERE broadcast_id = $1 AND action = 'BROADCAST' AND sent_at IS NOT NULL
+        GROUP BY 1
+     ),
+     inbound AS (
+       SELECT regexp_replace(ch.contact_number, '\\D', '', 'g') AS num, MAX(ch.timestamp) AS last_in
+         FROM coexistence.chat_history ch
+        WHERE ch.direction = 'incoming'
+          AND regexp_replace(ch.wa_number, '\\D', '', 'g') = regexp_replace($2::text, '\\D', '', 'g')
+          AND ch.timestamp > (SELECT MIN(sent_at) FROM logs)
+        GROUP BY 1
+     )
+     SELECT COUNT(*)::int AS replied
+       FROM logs l
+       JOIN inbound i ON i.num = l.num AND i.last_in > l.sent_at`,
+    [id, bRows[0].from_number]
+  );
+
+  // Stamp completed_at once every send has finished dispatching (no PENDING
+  // rows left) — that's what "campaign completed" means for the sender. It
+  // deliberately does NOT wait for read receipts: plenty of recipients never
+  // open a message, so a read-based condition would leave most campaigns
+  // showing "in progress" forever. Delivered/read keep climbing afterwards and
+  // the KPI cards reflect that; only the send window is what's timed here.
+  //
+  // Guarded on status <> 'SENDING': /send flips the row to SENDING *before* it
+  // inserts the new PENDING logs, so a poll landing in that window would
+  // otherwise see the previous run's all-terminal rows, stamp NOW(), and — since
+  // the stamp is monotonic — freeze a wrong completion time for the new run.
+  const r0 = rollup[0] || {};
+  const sendsFinished = (r0.total || 0) > 0 && (r0.pending || 0) === 0;
+  if (sendsFinished && !bRows[0].completed_at && bRows[0].status !== 'SENDING') {
+    const { rows: stamped } = await pool.query(
+      `UPDATE coexistence.broadcasts SET completed_at = NOW()
+        WHERE id = $1 AND completed_at IS NULL AND status <> 'SENDING'
+        RETURNING completed_at`,
+      [id]
+    );
+    if (stamped[0]) bRows[0].completed_at = stamped[0].completed_at;
+  }
 
   // Normalise aggregated BROADCAST row to match the log shape the frontend expects
   const logs = [];
@@ -223,7 +330,17 @@ async function getBroadcastWithLogs(id) {
   logs.push(...testLogs);
   logs.sort((a, b) => new Date(b.sent_at || 0) - new Date(a.sent_at || 0));
 
-  return { ...bRows[0], logs, statusRollup: rollup[0] || {} };
+  // started_at prefers the column set by /send; MIN(sent_at) is the fallback for
+  // campaigns sent before that column existed.
+  return {
+    ...bRows[0],
+    logs,
+    statusRollup: {
+      ...(rollup[0] || {}),
+      replied: repliedRows[0]?.replied || 0,
+      started_at: bRows[0].started_at || rollup[0]?.first_sent_at || null,
+    },
+  };
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -266,6 +383,44 @@ router.get('/broadcasts', async (req, res) => {
   } catch (err) {
     console.error('[broadcasts] /broadcasts error:', err.message);
     res.status(500).json({ error: 'Failed to fetch broadcasts' });
+  }
+});
+
+// GET /broadcasts/counts — live counts per display_status, for the list view's
+// filter tab badges. Registered before /broadcasts/:id so Express doesn't match
+// "counts" as an :id. Unlike the list endpoint (which is filtered by the active
+// tab), this always reflects every broadcast — so switching tabs doesn't zero
+// out the other tabs' badges.
+router.get('/broadcasts/counts', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT display_status, COUNT(*)::int AS count FROM (
+         SELECT b.id,
+                CASE
+                  WHEN b.status = 'DRAFT' THEN 'DRAFT'
+                  WHEN b.status = 'SENDING' THEN 'SENDING'
+                  WHEN COUNT(*) FILTER (WHERE bl.status = 'PENDING') > 0 THEN 'SENDING'
+                  WHEN COUNT(*) FILTER (WHERE bl.status = 'failed') > 0
+                   AND COUNT(*) FILTER (WHERE bl.status IN ('sent','delivered','read')) = 0 THEN 'FAILED'
+                  WHEN COUNT(*) FILTER (WHERE bl.status = 'failed') > 0 THEN 'PARTIAL'
+                  WHEN COUNT(*) FILTER (WHERE bl.status IN ('sent','delivered','read')) > 0 THEN 'SENT'
+                  ELSE b.status
+                END AS display_status
+         FROM coexistence.broadcasts b
+         LEFT JOIN coexistence.broadcast_logs bl ON bl.broadcast_id = b.id AND bl.action = 'BROADCAST'
+         GROUP BY b.id, b.status
+       ) t
+       GROUP BY display_status`
+    );
+    const counts = { all: 0, DRAFT: 0, SENDING: 0, SENT: 0, PARTIAL: 0, FAILED: 0 };
+    for (const r of rows) {
+      counts.all += r.count;
+      if (counts[r.display_status] !== undefined) counts[r.display_status] = r.count;
+    }
+    res.json(counts);
+  } catch (err) {
+    console.error('[broadcasts] /broadcasts/counts error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch broadcast counts' });
   }
 });
 
@@ -424,22 +579,9 @@ router.delete('/broadcasts/:id', requirePermission('bulk-message'), async (req, 
 // POST /broadcasts/:id/send — real Meta send, one job per recipient via BullMQ
 router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (req, res) => {
   try {
-    const { rows: bRows } = await pool.query(
-      `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples,
-              t.header_media_library_id AS t_header_media_library_id
-         FROM coexistence.broadcasts b
-         LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
-        WHERE b.id = $1`,
-      [req.params.id]
-    );
-    if (bRows.length === 0) return res.status(404).json({ error: 'Broadcast not found' });
-    const broadcast = bRows[0];
-    const template = broadcast.message_type === 'template'
-      ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples,
-          header_media_library_id: broadcast.t_header_media_library_id }
-      : null;
+    const loaded = await loadBroadcastWithTemplate(req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Broadcast not found' });
+    const { broadcast, template } = loaded;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
     if (error) return res.status(400).json({ error });
@@ -454,46 +596,16 @@ router.post('/broadcasts/:id/send', requirePermission('bulk-message'), async (re
       ? await loadContactContext(recipients.map(r => (typeof r === 'string' ? r : r.contact_number)))
       : new Map();
 
-    // Resolve media once for media-type broadcasts
-    let resolvedMediaId = null;
-    // Resolve the media id for media-type broadcasts AND for template broadcasts
-    // whose template has a media header (IMAGE/VIDEO/DOCUMENT) — both pull from
-    // broadcast.media_library_id.
-    const _tplHt = template ? String(template.header_type || '').toUpperCase() : '';
-    const _needsHeaderMedia = broadcast.message_type === 'template' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(_tplHt);
-    // A media-header template carries its image on the TEMPLATE
-    // (message_templates.header_media_library_id), not on the broadcast — so fall
-    // back to it when the campaign didn't pick a separate media asset. Without
-    // this the send omits the header component and WhatsApp delivers text only.
-    const headerMediaLibId = broadcast.media_library_id || (template && template.header_media_library_id) || null;
-    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && headerMediaLibId) {
-      const { syncMediaToAccount } = require('./mediaLibrary');
-      const { rows: mRows } = await pool.query(
-        `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
-        [headerMediaLibId]
-      );
-      if (mRows.length) {
-        const media = mRows[0];
-        const { rows: sRows } = await pool.query(
-          `SELECT * FROM coexistence.media_meta_sync WHERE media_id = $1 AND account_id = $2`,
-          [media.id, account.id]
-        );
-        let sync = sRows[0];
-        const needsSync = !sync || sync.status !== 'synced' || !sync.meta_media_id || (sync.expires_at && new Date(sync.expires_at) <= new Date());
-        if (needsSync) {
-          sync = await syncMediaToAccount(media.id, account.id);
-          sync = {
-            meta_media_id: sync.metaMediaId,
-            expires_at: sync.expiresAt,
-            status: sync.status,
-          };
-        }
-        resolvedMediaId = sync.meta_media_id;
-      }
-    }
+    const resolvedMediaId = await resolveHeaderMedia({ broadcast, template, account });
 
+    // Each run times its own window: stamp started_at and clear completed_at,
+    // since a repeat send adds fresh PENDING rows. Setting status='SENDING'
+    // first also stops a concurrent poll from stamping completed_at against the
+    // previous run's rows (see the guard in getBroadcastWithLogs).
     await pool.query(
-      `UPDATE coexistence.broadcasts SET status = 'SENDING', updated_at = NOW() WHERE id = $1`,
+      `UPDATE coexistence.broadcasts
+          SET status = 'SENDING', started_at = NOW(), completed_at = NULL, updated_at = NOW()
+        WHERE id = $1`,
       [req.params.id]
     );
 
@@ -544,63 +656,14 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
     const { test_number } = req.body;
     if (!test_number) return res.status(400).json({ error: 'test_number required' });
 
-    const { rows: bRows } = await pool.query(
-      `SELECT b.*, t.id AS t_id, t.name AS t_name, t.language AS t_language, t.body AS t_body,
-              t.header_type AS t_header_type, t.header_text AS t_header_text, t.footer AS t_footer, t.buttons AS t_buttons, t.samples AS t_samples,
-              t.header_media_library_id AS t_header_media_library_id
-         FROM coexistence.broadcasts b
-         LEFT JOIN coexistence.message_templates t ON t.id = b.template_id
-        WHERE b.id = $1`,
-      [req.params.id]
-    );
-    if (bRows.length === 0) return res.status(404).json({ error: 'Broadcast not found' });
-    const broadcast = bRows[0];
-    const template = broadcast.message_type === 'template'
-      ? { id: broadcast.t_id, name: broadcast.t_name, language: broadcast.t_language, body: broadcast.t_body,
-          header_type: broadcast.t_header_type, header_text: broadcast.t_header_text, footer: broadcast.t_footer, buttons: broadcast.t_buttons, samples: broadcast.t_samples,
-          header_media_library_id: broadcast.t_header_media_library_id }
-      : null;
+    const loaded = await loadBroadcastWithTemplate(req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Broadcast not found' });
+    const { broadcast, template } = loaded;
 
     const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
     if (error) return res.status(400).json({ error });
 
-    // Resolve media once for media-type broadcasts
-    let resolvedMediaId = null;
-    // Resolve the media id for media-type broadcasts AND for template broadcasts
-    // whose template has a media header (IMAGE/VIDEO/DOCUMENT) — both pull from
-    // broadcast.media_library_id.
-    const _tplHt = template ? String(template.header_type || '').toUpperCase() : '';
-    const _needsHeaderMedia = broadcast.message_type === 'template' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(_tplHt);
-    // A media-header template carries its image on the TEMPLATE
-    // (message_templates.header_media_library_id), not on the broadcast — so fall
-    // back to it when the campaign didn't pick a separate media asset. Without
-    // this the send omits the header component and WhatsApp delivers text only.
-    const headerMediaLibId = broadcast.media_library_id || (template && template.header_media_library_id) || null;
-    if ((['image', 'video', 'audio', 'document'].includes(broadcast.message_type) || _needsHeaderMedia) && headerMediaLibId) {
-      const { syncMediaToAccount } = require('./mediaLibrary');
-      const { rows: mRows } = await pool.query(
-        `SELECT * FROM coexistence.media_library WHERE id = $1 AND deleted_at IS NULL`,
-        [headerMediaLibId]
-      );
-      if (mRows.length) {
-        const media = mRows[0];
-        const { rows: sRows } = await pool.query(
-          `SELECT * FROM coexistence.media_meta_sync WHERE media_id = $1 AND account_id = $2`,
-          [media.id, account.id]
-        );
-        let sync = sRows[0];
-        const needsSync = !sync || sync.status !== 'synced' || !sync.meta_media_id || (sync.expires_at && new Date(sync.expires_at) <= new Date());
-        if (needsSync) {
-          sync = await syncMediaToAccount(media.id, account.id);
-          sync = {
-            meta_media_id: sync.metaMediaId,
-            expires_at: sync.expiresAt,
-            status: sync.status,
-          };
-        }
-        resolvedMediaId = sync.meta_media_id;
-      }
-    }
+    const resolvedMediaId = await resolveHeaderMedia({ broadcast, template, account });
 
     const { rows: logRows } = await pool.query(
       `INSERT INTO coexistence.broadcast_logs (broadcast_id, action, sent_to, status)
@@ -625,6 +688,192 @@ router.post('/broadcasts/:id/test', requirePermission('bulk-message'), async (re
   } catch (err) {
     console.error('[broadcasts] POST /broadcasts/:id/test error:', err.message);
     res.status(500).json({ error: 'Failed to send test' });
+  }
+});
+
+// Per-recipient display status, derived the same way the aggregate rollup is:
+// PENDING → 'pending'; failed → 'failed'; otherwise escalate through
+// chat_history's tracked status (sent/delivered/read) for that message.
+// Lowercased because migration 040 kept the legacy uppercase 'PENDING'/'SENT'/
+// 'FAILED' values valid for rows written before the delivery statuses existed —
+// an old 'FAILED' row must still read as failed (and get a Retry button).
+function recipientDisplayStatus(row) {
+  const blStatus = String(row.bl_status || '').toLowerCase();
+  if (blStatus === 'pending') return 'pending';
+  if (blStatus === 'failed') return 'failed';
+  if (row.chat_status === 'read') return 'read';
+  if (row.chat_status === 'delivered') return 'delivered';
+  return 'sent';
+}
+
+// GET /broadcasts/:id/recipients — one row per recipient. If a broadcast was
+// repeated, only the most recent attempt for each contact is shown (matches
+// what "current delivery status per recipient" means) — retrying reuses the
+// same log row so this never has to pick between duplicates either.
+router.get('/broadcasts/:id/recipients', async (req, res) => {
+  try {
+    const { rows: bRows } = await pool.query(
+      'SELECT recipient_numbers, from_number FROM coexistence.broadcasts WHERE id = $1',
+      [req.params.id]
+    );
+    if (bRows.length === 0) return res.status(404).json({ error: 'Broadcast not found' });
+
+    // Fallback name source: the recipient list captured when the campaign was
+    // created (covers a contact later renamed/deleted from the Contacts panel).
+    const nameByNumber = new Map();
+    const recipientList = Array.isArray(bRows[0].recipient_numbers) ? bRows[0].recipient_numbers : [];
+    for (const r of recipientList) {
+      if (r && typeof r === 'object' && r.contact_number) {
+        nameByNumber.set(String(r.contact_number).replace(/\D/g, ''), r.name || '');
+      }
+    }
+
+    const { rows } = await pool.query(
+      `WITH latest AS (
+         SELECT DISTINCT ON (regexp_replace(sent_to, '\\D', '', 'g'))
+           id, sent_to, status AS bl_status, sent_at, wa_message_id, error_message
+         FROM coexistence.broadcast_logs
+         WHERE broadcast_id = $1 AND action = 'BROADCAST'
+         ORDER BY regexp_replace(sent_to, '\\D', '', 'g'), sent_at DESC, id DESC
+       )
+       SELECT l.id AS log_id, l.sent_to, l.bl_status, l.sent_at, l.error_message,
+              ch.status AS chat_status, c.name AS contact_name
+       FROM latest l
+       LEFT JOIN coexistence.chat_history ch ON ch.message_id = l.wa_message_id
+       LEFT JOIN coexistence.contacts c
+              ON regexp_replace(c.contact_number, '\\D', '', 'g') = regexp_replace(l.sent_to, '\\D', '', 'g')
+             AND regexp_replace(c.wa_number, '\\D', '', 'g') = regexp_replace($2::text, '\\D', '', 'g')
+       ORDER BY l.sent_at DESC NULLS LAST`,
+      [req.params.id, bRows[0].from_number]
+    );
+
+    const recipients = rows.map(r => ({
+      logId: r.log_id,
+      contactNumber: r.sent_to,
+      name: r.contact_name || nameByNumber.get(String(r.sent_to).replace(/\D/g, '')) || '',
+      status: recipientDisplayStatus(r),
+      errorMessage: r.error_message,
+      sentAt: r.sent_at,
+    }));
+    res.json({ recipients });
+  } catch (err) {
+    console.error('[broadcasts] GET /broadcasts/:id/recipients error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch recipients' });
+  }
+});
+
+// POST /broadcasts/:id/recipients/:logId/retry — re-send to a single failed
+// recipient. Resets the SAME log row to PENDING and re-enqueues (rather than
+// inserting a new row) so the recipient still has exactly one "latest attempt".
+router.post('/broadcasts/:id/recipients/:logId/retry', requirePermission('bulk-message'), async (req, res) => {
+  try {
+    const { rows: logRows } = await pool.query(
+      `SELECT * FROM coexistence.broadcast_logs WHERE id = $1 AND broadcast_id = $2 AND action = 'BROADCAST'`,
+      [req.params.logId, req.params.id]
+    );
+    if (logRows.length === 0) return res.status(404).json({ error: 'Recipient not found' });
+    const log = logRows[0];
+    // Lowercased — migration 040 kept legacy uppercase 'FAILED' rows valid.
+    if (String(log.status).toLowerCase() !== 'failed') {
+      return res.status(400).json({ error: 'Only failed recipients can be retried' });
+    }
+
+    const loaded = await loadBroadcastWithTemplate(req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Broadcast not found' });
+    const { broadcast, template } = loaded;
+
+    const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
+    if (error) return res.status(400).json({ error });
+
+    const resolvedMediaId = await resolveHeaderMedia({ broadcast, template, account });
+
+    const ctxMap = broadcast.message_type === 'template'
+      ? await loadContactContext([log.sent_to])
+      : new Map();
+    const ctx = ctxMap.get(String(log.sent_to).replace(/\D/g, '')) || {};
+    const recipient = { contact_number: log.sent_to, name: ctx.name || '', custom_fields: ctx.custom_fields || {}, tags: ctx.tags || [] };
+
+    await pool.query(
+      `UPDATE coexistence.broadcast_logs SET status = 'PENDING', error_message = NULL, wa_message_id = NULL, sent_at = NOW() WHERE id = $1`,
+      [log.id]
+    );
+    // A retry un-terminal-izes the campaign — clear completed_at so the detail
+    // view resumes showing "in progress" (and polling) until this settles too.
+    await pool.query(`UPDATE coexistence.broadcasts SET completed_at = NULL WHERE id = $1`, [req.params.id]);
+
+    try {
+      await enqueueBroadcastRecipient({ broadcast, template, account, recipient, broadcastLogId: log.id, resolvedMediaId });
+    } catch (jobErr) {
+      await pool.query(
+        `UPDATE coexistence.broadcast_logs SET status='failed', error_message=$1 WHERE id=$2`,
+        [jobErr.message.slice(0, 500), log.id]
+      );
+    }
+
+    res.json(await getBroadcastWithLogs(req.params.id));
+  } catch (err) {
+    console.error('[broadcasts] POST /broadcasts/:id/recipients/:logId/retry error:', err.message);
+    res.status(500).json({ error: 'Failed to retry recipient' });
+  }
+});
+
+// POST /broadcasts/:id/retry-failed — retry every currently-failed recipient
+// (latest attempt per contact) in one action.
+router.post('/broadcasts/:id/retry-failed', requirePermission('bulk-message'), async (req, res) => {
+  try {
+    const loaded = await loadBroadcastWithTemplate(req.params.id);
+    if (!loaded) return res.status(404).json({ error: 'Broadcast not found' });
+    const { broadcast, template } = loaded;
+
+    const { rows: toRetry } = await pool.query(
+      `WITH latest AS (
+         SELECT DISTINCT ON (regexp_replace(sent_to, '\\D', '', 'g'))
+           id, sent_to, status
+         FROM coexistence.broadcast_logs
+         WHERE broadcast_id = $1 AND action = 'BROADCAST'
+         ORDER BY regexp_replace(sent_to, '\\D', '', 'g'), sent_at DESC, id DESC
+       )
+       SELECT id, sent_to FROM latest WHERE LOWER(status) = 'failed'`,
+      [req.params.id]
+    );
+
+    if (toRetry.length === 0) {
+      return res.json({ ...(await getBroadcastWithLogs(req.params.id)), retried: 0 });
+    }
+
+    const { account, error } = await resolveAccount({ fromPhoneNumber: broadcast.from_number });
+    if (error) return res.status(400).json({ error });
+
+    const resolvedMediaId = await resolveHeaderMedia({ broadcast, template, account });
+    const contactCtx = broadcast.message_type === 'template'
+      ? await loadContactContext(toRetry.map(r => r.sent_to))
+      : new Map();
+
+    await pool.query(`UPDATE coexistence.broadcasts SET completed_at = NULL WHERE id = $1`, [req.params.id]);
+
+    let retried = 0;
+    for (const row of toRetry) {
+      const ctx = contactCtx.get(String(row.sent_to).replace(/\D/g, '')) || {};
+      const recipient = { contact_number: row.sent_to, name: ctx.name || '', custom_fields: ctx.custom_fields || {}, tags: ctx.tags || [] };
+      await pool.query(
+        `UPDATE coexistence.broadcast_logs SET status = 'PENDING', error_message = NULL, wa_message_id = NULL, sent_at = NOW() WHERE id = $1`,
+        [row.id]
+      );
+      try {
+        await enqueueBroadcastRecipient({ broadcast, template, account, recipient, broadcastLogId: row.id, resolvedMediaId });
+        retried++;
+      } catch (jobErr) {
+        await pool.query(
+          `UPDATE coexistence.broadcast_logs SET status='failed', error_message=$1 WHERE id=$2`,
+          [jobErr.message.slice(0, 500), row.id]
+        );
+      }
+    }
+
+    res.json({ ...(await getBroadcastWithLogs(req.params.id)), retried });
+  } catch (err) {
+    console.error('[broadcasts] POST /broadcasts/:id/retry-failed error:', err.message);
+    res.status(500).json({ error: 'Failed to retry failed recipients' });
   }
 });
 

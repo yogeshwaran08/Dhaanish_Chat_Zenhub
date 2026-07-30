@@ -12,7 +12,7 @@ const { markAccountHealth, classifyMetaError } = require('../services/accountHea
 const storage = require('../util/pgStorage');
 const { syncMediaToAccount } = require('./mediaLibrary');
 const { assertWaAccess, assertContactAccess } = require('../middleware/access');
-const { isAdmin } = require('../permissions');
+const { isAdmin, hasPermission } = require('../permissions');
 const { canonicalizeMime, chatKindFor, CHAT_TYPES_MSG } = require('../util/metaMime');
 const ExcelJS = require('exceljs');
 const { Readable } = require('stream');
@@ -150,6 +150,88 @@ async function parseSheetRows(file) {
     rows.push(obj);
   });
   return rows;
+}
+
+/**
+ * Resolve the tag every imported contact should be filed under, from the
+ * multipart fields sent alongside the sheet. Three shapes are accepted:
+ *   - tagId                                  → use an existing tag
+ *   - newTagName + categoryId                → create a tag in an existing category
+ *   - newTagName + newCategoryName           → create the category too
+ * Nothing given → returns null (tagging is optional; the import behaves as before).
+ *
+ * Creating a tag / category needs the same permission as doing it from Admin
+ * Settings, so a sales user can only pick from what already exists. Names are
+ * matched case-insensitively within their scope so a repeated import doesn't
+ * pile up duplicates.
+ *
+ * Throws { status, error } — the caller turns it into an HTTP response.
+ */
+function genTagId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+}
+
+async function resolveImportTag(req) {
+  const tagId = String(req.body.tagId || '').trim();
+  const newTagName = String(req.body.newTagName || '').trim();
+  const tagColor = String(req.body.tagColor || '').trim() || '#dc2626';
+  const categoryId = String(req.body.categoryId || '').trim();
+  const newCategoryName = String(req.body.newCategoryName || '').trim();
+
+  if (tagId) {
+    const { rows } = await pool.query(
+      'SELECT id, name, color, category_id FROM coexistence.tags WHERE id = $1',
+      [tagId]
+    );
+    if (rows.length === 0) throw { status: 400, error: 'The selected tag no longer exists. Refresh and try again.' };
+    return rows[0];
+  }
+
+  if (!newTagName) return null;
+
+  // ── Resolve the category the new tag lives under ──────────────────────────
+  let catId = categoryId;
+  if (!catId) {
+    if (!newCategoryName) throw { status: 400, error: 'Pick a category for the new tag.' };
+    if (!hasPermission(req.user, 'admin-settings:category')) {
+      throw { status: 403, error: 'You are not allowed to create categories.' };
+    }
+    const existingCat = await pool.query(
+      'SELECT id FROM coexistence.categories WHERE LOWER(name) = LOWER($1) LIMIT 1',
+      [newCategoryName]
+    );
+    if (existingCat.rows.length > 0) {
+      catId = existingCat.rows[0].id;
+    } else {
+      const created = await pool.query(
+        `INSERT INTO coexistence.categories (id, name, description) VALUES ($1, $2, '') RETURNING id`,
+        [genTagId('cat'), newCategoryName]
+      );
+      catId = created.rows[0].id;
+    }
+  } else {
+    const cat = await pool.query('SELECT id FROM coexistence.categories WHERE id = $1', [catId]);
+    if (cat.rows.length === 0) throw { status: 400, error: 'The selected category no longer exists. Refresh and try again.' };
+  }
+
+  // ── Reuse a same-named tag in that category, else create it ───────────────
+  const existingTag = await pool.query(
+    `SELECT id, name, color, category_id FROM coexistence.tags
+     WHERE category_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
+    [catId, newTagName]
+  );
+  if (existingTag.rows.length > 0) return existingTag.rows[0];
+
+  if (!hasPermission(req.user, 'admin-settings:tags')) {
+    throw { status: 403, error: 'You are not allowed to create tags.' };
+  }
+  const created = await pool.query(
+    `INSERT INTO coexistence.tags (id, name, color, category_id)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, name, color, category_id`,
+    [genTagId('tag'), newTagName, tagColor, catId]
+  );
+  return created.rows[0];
 }
 
 const DEFAULT_DATA_WINDOW = "INTERVAL '14 days'";
@@ -446,6 +528,21 @@ router.post('/contacts/import', sheetUpload.single('file'), async (req, res) => 
     // Non-admins may only import onto a WhatsApp number they have access to.
     if (!admin && !(await assertWaAccess(req, res, waNumber))) return;
 
+    // Optional tag to file every imported contact under — an existing tag, or one
+    // created on the fly (optionally with a new category). Resolved before parsing
+    // so a bad tag selection fails fast without touching any contact row.
+    let importTag;
+    try {
+      importTag = await resolveImportTag(req);
+    } catch (e) {
+      if (e && e.status) return res.status(e.status).json({ error: e.error });
+      throw e;
+    }
+    const tagJson = importTag
+      ? JSON.stringify([{ id: importTag.id, name: importTag.name, color: importTag.color, category_id: importTag.category_id }])
+      : null;
+    const tagCategoryId = importTag ? importTag.category_id : null;
+
     let rows;
     try {
       // exceljs returns cell values as text/number; cellToString normalises them
@@ -480,27 +577,50 @@ router.post('/contacts/import', sheetUpload.single('file'), async (req, res) => 
       if (seen.has(phone)) { skipped.push({ row: rowNum, reason: 'Duplicate phone in sheet' }); continue; }
       seen.add(phone);
 
+      // Tags to write on insert: the import tag (if any), else none. On conflict
+      // (an existing contact) the tag replaces any existing tag from the *same*
+      // category while leaving tags from other categories untouched — matching
+      // the one-tag-per-category rule enforced elsewhere in the app. When no
+      // import tag was selected, tags are left completely alone (old behavior).
+      const insertTagsJson = tagJson || '[]';
+
       let result;
       if (admin) {
         result = await pool.query(`
           INSERT INTO coexistence.contacts (wa_number, contact_number, name, tags, custom_fields, updated_at)
-          VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb, NOW())
+          VALUES ($1, $2, $3, $4::jsonb, '{}'::jsonb, NOW())
           ON CONFLICT (wa_number, contact_number)
-          DO UPDATE SET name = COALESCE(EXCLUDED.name, coexistence.contacts.name), updated_at = NOW()
+          DO UPDATE SET
+            name = COALESCE(EXCLUDED.name, coexistence.contacts.name),
+            tags = CASE WHEN $5::text IS NULL THEN coexistence.contacts.tags
+                        ELSE COALESCE(
+                          (SELECT jsonb_agg(elem) FROM jsonb_array_elements(coexistence.contacts.tags) elem
+                           WHERE (elem->>'category_id') IS DISTINCT FROM $5),
+                          '[]'::jsonb
+                        ) || $4::jsonb
+                   END,
+            updated_at = NOW()
           RETURNING (xmax = 0) AS inserted
-        `, [waNumber, phone, name]);
+        `, [waNumber, phone, name, insertTagsJson, tagCategoryId]);
       } else {
         // New rows assign to the importing user; existing rows keep their current
         // owner (COALESCE) so an import can't silently steal another user's contact.
         result = await pool.query(`
           INSERT INTO coexistence.contacts (wa_number, contact_number, name, tags, custom_fields, assigned_user_id, updated_at)
-          VALUES ($1, $2, $3, '[]'::jsonb, '{}'::jsonb, $4, NOW())
+          VALUES ($1, $2, $3, $5::jsonb, '{}'::jsonb, $4, NOW())
           ON CONFLICT (wa_number, contact_number)
           DO UPDATE SET name = COALESCE(EXCLUDED.name, coexistence.contacts.name),
                         assigned_user_id = COALESCE(coexistence.contacts.assigned_user_id, EXCLUDED.assigned_user_id),
+                        tags = CASE WHEN $6::text IS NULL THEN coexistence.contacts.tags
+                                    ELSE COALESCE(
+                                      (SELECT jsonb_agg(elem) FROM jsonb_array_elements(coexistence.contacts.tags) elem
+                                       WHERE (elem->>'category_id') IS DISTINCT FROM $6),
+                                      '[]'::jsonb
+                                    ) || $5::jsonb
+                               END,
                         updated_at = NOW()
           RETURNING (xmax = 0) AS inserted
-        `, [waNumber, phone, name, req.user.id]);
+        `, [waNumber, phone, name, req.user.id, insertTagsJson, tagCategoryId]);
       }
       if (result.rows[0]?.inserted) imported++; else updated++;
     }

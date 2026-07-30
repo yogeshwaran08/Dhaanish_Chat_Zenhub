@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Send, ArrowLeft, Trash2, Loader2, Clock, Users, Phone, FileText, Repeat, X, CheckCircle, Eye, Search, Plus, Play, Music } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Send, ArrowLeft, Trash2, Loader2, Clock, Users, Phone, FileText, Repeat, X, CheckCircle, Search, Plus, Play, Music, MessageSquareReply, XCircle, RotateCcw, Download } from 'lucide-react';
 import { api } from '../api.js';
 import { C, FONT, formatDate, formatTime, maskPhone, darkenColor } from '../constants.js';
 import MaskedNumber from '../components/MaskedNumber.jsx';
@@ -78,6 +78,35 @@ function LogStatusBadge({ status }) {
       border: `1px solid ${c.border}`,
     }}>
       {status}
+    </span>
+  );
+}
+
+const RECIPIENT_FILTER_TABS = [
+  { key: 'all', label: 'All' },
+  { key: 'delivered', label: 'Delivered' },
+  { key: 'failed', label: 'Failed' },
+  { key: 'pending', label: 'Pending' },
+];
+
+function RecipientStatusBadge({ status }) {
+  const config = {
+    read:      { bg: '#EDE9FE', color: '#6d28d9', border: '#ddd6fe', label: 'Read' },
+    delivered: { bg: '#E1F5EE', color: '#0F6E56', border: '#bfe8da', label: 'Delivered' },
+    sent:      { bg: '#dbeafe', color: '#1e40af', border: '#bfdbfe', label: 'Sent' },
+    failed:    { bg: '#fee2e2', color: '#991b1b', border: '#fecaca', label: 'Failed' },
+    pending:   { bg: '#f3f4f6', color: 'var(--c-textSecondary)', border: '#e5e7eb', label: 'Pending' },
+  };
+  const c = config[status] || config.pending;
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      padding: '2px 8px', borderRadius: 4,
+      background: c.bg, color: c.color,
+      fontSize: 11, fontWeight: 600, fontFamily: FONT,
+      border: `1px solid ${c.border}`,
+    }}>
+      {c.label}
     </span>
   );
 }
@@ -177,20 +206,21 @@ function BroadcastMessagePreview({ messageType, body, url, mediaLibraryId, capti
   );
 }
 
-function KpiCards({ metrics }) {
-  const { totalRecipients, totalSent, totalDelivered, totalRead } = metrics;
+function KpiCards({ metrics, onFailedClick }) {
+  const { totalRecipients, totalSent, totalDelivered, totalReplied, totalFailed } = metrics;
 
   const cards = [
     { key: 'recipients', label: 'Recipients', value: totalRecipients, color: '#dc2626', bg: '#FCEBEB', icon: Users },
     { key: 'sent', label: 'Sent', value: totalSent, color: '#2563eb', bg: '#E3F2FD', icon: Send },
-    { key: 'delivered', label: 'Received', value: totalDelivered, color: '#0F6E56', bg: '#E1F5EE', icon: CheckCircle },
-    { key: 'read', label: 'Read', value: totalRead, color: '#7c3aed', bg: '#EDE9FE', icon: Eye },
+    { key: 'delivered', label: 'Delivered', value: totalDelivered, color: '#0F6E56', bg: '#E1F5EE', icon: CheckCircle },
+    { key: 'replied', label: 'Replied', value: totalReplied, color: '#7c3aed', bg: '#EDE9FE', icon: MessageSquareReply },
+    { key: 'failed', label: 'Failed', value: totalFailed, color: '#dc2626', bg: '#FEE2E2', icon: XCircle, onClick: totalFailed > 0 ? onFailedClick : undefined },
   ];
 
   return (
     <div style={{
       display: 'grid',
-      gridTemplateColumns: 'repeat(4, 1fr)',
+      gridTemplateColumns: 'repeat(5, 1fr)',
       gap: 16,
       marginBottom: 24,
     }}>
@@ -199,6 +229,7 @@ function KpiCards({ metrics }) {
         return (
           <div
             key={card.key}
+            onClick={card.onClick}
             style={{
               background: C.cardBg,
               borderRadius: 12,
@@ -207,6 +238,7 @@ function KpiCards({ metrics }) {
               display: 'flex',
               alignItems: 'center',
               gap: 16,
+              cursor: card.onClick ? 'pointer' : 'default',
             }}
           >
             <div style={{
@@ -253,6 +285,10 @@ function formatSentTo(log) {
 export default function BulkMessagePage({ onNavigate }) {
   const [view, setView] = useState('list'); // 'list' | 'detail'
   const [broadcasts, setBroadcasts] = useState([]);
+  // Unfiltered per-status counts for the filter tab badges — kept separate from
+  // `broadcasts` (which is re-fetched *filtered* to the active tab), so switching
+  // tabs doesn't zero out the other tabs' badge numbers.
+  const [statusCounts, setStatusCounts] = useState({});
   const [filterStatus, setFilterStatus] = useState('all');
   const [loading, setLoading] = useState(false);
   const [selectedBroadcast, setSelectedBroadcast] = useState(null);
@@ -263,6 +299,14 @@ export default function BulkMessagePage({ onNavigate }) {
   const [sendingTest, setSendingTest] = useState(false);
   const [deleteModal, setDeleteModal] = useState({ open: false, broadcast: null });
   const [selectedLog, setSelectedLog] = useState(null);
+
+  // ─── Recipients List (detail view) ──────────────────────────────────────────
+  const [recipients, setRecipients] = useState([]);
+  const [recipientsLoading, setRecipientsLoading] = useState(false);
+  const [recipientFilter, setRecipientFilter] = useState('all'); // all | delivered | failed | pending
+  const [retryingLogId, setRetryingLogId] = useState(null);
+  const [retryingAll, setRetryingAll] = useState(false);
+  const recipientsSectionRef = useRef(null);
 
   // ─── New Broadcast Modal State ──────────────────────────────────────────────
   const [newBroadcastModal, setNewBroadcastModal] = useState(false);
@@ -282,7 +326,7 @@ export default function BulkMessagePage({ onNavigate }) {
   const [newBroadcastMediaLibraryId, setNewBroadcastMediaLibraryId] = useState('');
   const [newBroadcastMediaItems, setNewBroadcastMediaItems] = useState([]);
   const [newBroadcastCaption, setNewBroadcastCaption] = useState('');
-  const [, setNewBroadcastMediaLoading] = useState(false);
+  const [newBroadcastMediaLoading, setNewBroadcastMediaLoading] = useState(false);
   const [, setNewTestNumberSearch] = useState('');
   const [, setNewTestNumberOpen] = useState(false);
 
@@ -367,6 +411,12 @@ export default function BulkMessagePage({ onNavigate }) {
     return false;
   };
 
+  // Sending additionally needs the header asset for a media-header template —
+  // Meta rejects the send without it. Saving a draft doesn't: the user can pick
+  // the asset later, so this is kept out of isBroadcastFormInvalid().
+  const isBroadcastSendInvalid = () =>
+    isBroadcastFormInvalid() || (!!headerMediaType && !newBroadcastMediaLibraryId);
+
   // Reset modal state when closed
   const closeNewBroadcastModal = () => {
     setNewBroadcastModal(false);
@@ -403,8 +453,17 @@ export default function BulkMessagePage({ onNavigate }) {
     }
   };
 
+  const loadStatusCounts = async () => {
+    try {
+      setStatusCounts(await api.broadcasts.counts());
+    } catch (err) {
+      console.error('Failed to load broadcast counts:', err);
+    }
+  };
+
   useEffect(() => {
     loadBroadcasts();
+    loadStatusCounts();
   }, [filterStatus]);
 
   // Load media library items when message type is a media type, OR when a
@@ -435,12 +494,27 @@ export default function BulkMessagePage({ onNavigate }) {
       .finally(() => setNewBroadcastMediaLoading(false));
   }, [newBroadcastMessageType, newBroadcastTemplateId, templates, linkedAccount]);
 
+  const loadRecipients = async (broadcastId, quiet = false) => {
+    if (!quiet) setRecipientsLoading(true);
+    try {
+      const data = await api.broadcasts.recipients(broadcastId);
+      setRecipients(data.recipients || []);
+    } catch (err) {
+      console.error('Failed to load recipients:', err);
+      if (!quiet) setRecipients([]);
+    } finally {
+      if (!quiet) setRecipientsLoading(false);
+    }
+  };
+
   const openDetail = async (broadcast) => {
     setDetailLoading(true);
     setView('detail');
+    setRecipientFilter('all');
     try {
       const data = await api.broadcasts.get(broadcast.id);
       setSelectedBroadcast(data);
+      loadRecipients(broadcast.id);
     } catch (err) {
       alert('Failed to load broadcast details');
       setView('list');
@@ -449,10 +523,10 @@ export default function BulkMessagePage({ onNavigate }) {
     }
   };
 
-  // Live-refresh the broadcast detail while the view is open. Meta sends
-  // `sent` → `delivered` → `read` webhooks for each recipient over several
-  // seconds/minutes; without polling, the Delivery Summary stays frozen at
-  // whatever the values were when the modal opened. Stop polling when every
+  // Live-refresh the broadcast detail (KPIs + Recipients list) while the view
+  // is open. Meta sends `sent` → `delivered` → `read` webhooks for each
+  // recipient over several seconds/minutes; without polling, the numbers stay
+  // frozen at whatever they were when the view opened. Stop polling once every
   // recipient has reached a terminal state (read or failed).
   useEffect(() => {
     if (view !== 'detail' || !selectedBroadcast?.id) return;
@@ -468,11 +542,71 @@ export default function BulkMessagePage({ onNavigate }) {
       try {
         const data = await api.broadcasts.get(selectedBroadcast.id);
         setSelectedBroadcast(prev => prev && prev.id === data.id ? data : prev);
+        loadRecipients(selectedBroadcast.id, true);
       } catch { /* swallow — next tick retries */ }
     };
     const intervalId = setInterval(tick, 4000);
     return () => clearInterval(intervalId);
   }, [view, selectedBroadcast?.id, selectedBroadcast?.statusRollup?.read, selectedBroadcast?.statusRollup?.failed, selectedBroadcast?.statusRollup?.total]);
+
+  const handleFailedKpiClick = () => {
+    setRecipientFilter('failed');
+    recipientsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const handleRetryRecipient = async (logId) => {
+    if (!selectedBroadcast || retryingLogId) return;
+    setRetryingLogId(logId);
+    try {
+      const data = await api.broadcasts.retryRecipient(selectedBroadcast.id, logId);
+      setSelectedBroadcast(data);
+      await loadRecipients(selectedBroadcast.id, true);
+    } catch (err) {
+      alert('Retry failed: ' + err.message);
+    } finally {
+      setRetryingLogId(null);
+    }
+  };
+
+  const handleRetryAllFailed = async () => {
+    if (!selectedBroadcast || retryingAll) return;
+    setRetryingAll(true);
+    try {
+      const data = await api.broadcasts.retryFailed(selectedBroadcast.id);
+      setSelectedBroadcast(data);
+      await loadRecipients(selectedBroadcast.id, true);
+    } catch (err) {
+      alert('Retry failed: ' + err.message);
+    } finally {
+      setRetryingAll(false);
+    }
+  };
+
+  // Export the currently-filtered Recipients list to a CSV download —
+  // client-side, since the data is already loaded for the table.
+  const exportRecipientsCsv = (rows) => {
+    const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const header = ['Name', 'Number', 'Status', 'Error', 'Time'];
+    const lines = [header.join(',')];
+    for (const r of rows) {
+      lines.push([
+        escape(r.name || ''),
+        escape(r.contactNumber || ''),
+        escape(r.status || ''),
+        escape(r.errorMessage || ''),
+        escape(r.sentAt ? new Date(r.sentAt).toISOString() : ''),
+      ].join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `broadcast-${selectedBroadcast?.id}-recipients.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   const handleDelete = async () => {
     const b = deleteModal.broadcast;
@@ -481,6 +615,7 @@ export default function BulkMessagePage({ onNavigate }) {
       await api.broadcasts.delete(b.id);
       setBroadcasts(prev => prev.filter(x => x.id !== b.id));
       setDeleteModal({ open: false, broadcast: null });
+      loadStatusCounts();
       if (selectedBroadcast?.id === b.id) {
         setView('list');
         setSelectedBroadcast(null);
@@ -498,6 +633,7 @@ export default function BulkMessagePage({ onNavigate }) {
       onSuccess: (deletedIds) => {
         const set = new Set(deletedIds);
         setBroadcasts(prev => prev.filter(b => !set.has(b.id)));
+        loadStatusCounts();
         if (selectedBroadcast?.id && set.has(selectedBroadcast.id)) {
           setView('list');
           setSelectedBroadcast(null);
@@ -515,6 +651,7 @@ export default function BulkMessagePage({ onNavigate }) {
       setRepeatModal(false);
       setRepeatTestNumber('');
       loadBroadcasts();
+      loadStatusCounts();
     } catch (err) {
       alert('Failed to repeat broadcast: ' + err.message);
     } finally {
@@ -576,11 +713,29 @@ export default function BulkMessagePage({ onNavigate }) {
       totalRecipients,
       totalSent: r.sent || 0,
       totalDelivered: r.delivered || 0,
-      totalRead: r.read || 0,
+      totalReplied: r.replied || 0,
       totalFailed: r.failed || 0,
       totalPending: r.pending || 0,
       rollupTotal: r.total || totalRecipients,
+      startedAt: r.started_at || null,
     };
+  };
+
+  // "2m 14s" / "1h 5m" / "3d 2h" style duration string between two timestamps
+  // (or now, for an in-progress campaign).
+  const formatDuration = (fromTs, toTs) => {
+    if (!fromTs) return null;
+    const ms = new Date(toTs || Date.now()) - new Date(fromTs);
+    if (!Number.isFinite(ms) || ms < 0) return null;
+    const s = Math.floor(ms / 1000);
+    const d = Math.floor(s / 86400);
+    const h = Math.floor((s % 86400) / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${sec}s`;
+    return `${sec}s`;
   };
 
   // ─── New Broadcast Modal Helpers ────────────────────────────────────────────
@@ -750,6 +905,7 @@ export default function BulkMessagePage({ onNavigate }) {
       }
       closeNewBroadcastModal();
       loadBroadcasts();
+      loadStatusCounts();
     } catch (err) {
       alert(status === 'SENT' ? 'Broadcast failed: ' + err.message : 'Save failed: ' + err.message);
     } finally {
@@ -806,7 +962,7 @@ export default function BulkMessagePage({ onNavigate }) {
                     color: active ? '#fff' : C.primary,
                     padding: '1px 7px', borderRadius: 99,
                   }}>
-                    {broadcasts.filter(b => b.status === tab.key).length}
+                    {statusCounts[tab.key] || 0}
                   </span>
                 )}
               </button>
@@ -1017,7 +1173,7 @@ export default function BulkMessagePage({ onNavigate }) {
                         <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Message Template</div>
                         <SearchableSelect
                           value={newBroadcastTemplateId}
-                          onChange={(val) => setNewBroadcastTemplateId(val)}
+                          onChange={(val) => { setNewBroadcastTemplateId(val); setNewBroadcastMediaLibraryId(''); }}
                           options={eligibleTemplates.map(t => ({ value: String(t.id), label: `${t.name} (${t.category})`, sublabel: t.language || '' }))}
                           placeholder="Select a template..."
                           searchPlaceholder="Search templates..."
@@ -1033,6 +1189,39 @@ export default function BulkMessagePage({ onNavigate }) {
                           <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>No approved templates for <strong>{linkedAccount.displayName}</strong>. Create one in Template Builder.</div>
                         ) : null}
                       </div>
+
+                      {/* Header media — required for IMAGE/VIDEO/DOCUMENT header templates */}
+                      {headerMediaType && (
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: C.textSecondary, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                            Header {headerMediaType} <span style={{ color: C.primary }}>*</span>
+                          </div>
+                          <SearchableSelect
+                            value={newBroadcastMediaLibraryId}
+                            onChange={(val) => setNewBroadcastMediaLibraryId(val)}
+                            disabled={newBroadcastMediaLoading}
+                            options={newBroadcastMediaItems.map(m => ({ value: String(m.id), label: m.name || m.originalName || `Media #${m.id}` }))}
+                            placeholder={newBroadcastMediaLoading ? 'Loading...' : `— Select ${headerMediaType} —`}
+                            searchPlaceholder="Search media..."
+                          />
+                          {newBroadcastMediaItems.length === 0 && !newBroadcastMediaLoading ? (
+                            <div style={{ fontSize: 11, color: '#E65100', marginTop: 4, fontFamily: FONT }}>
+                              This template has a {headerMediaType} header — upload a {headerMediaType} to the Media Library first.
+                            </div>
+                          ) : (
+                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 4, fontFamily: FONT }}>
+                              This template has a {headerMediaType} header — pick the {headerMediaType} to send in the header.
+                            </div>
+                          )}
+                          {newBroadcastMediaLibraryId && headerMediaType === 'image' && (
+                            <img
+                              src={api.mediaLibrary.downloadUrl(Number(newBroadcastMediaLibraryId))}
+                              alt=""
+                              style={{ marginTop: 8, width: '100%', maxHeight: 140, objectFit: 'cover', borderRadius: 8, border: `1px solid ${C.border}`, display: 'block' }}
+                            />
+                          )}
+                        </div>
+                      )}
 
                       {/* Variable Mapping — map each {{n}} to a contact field, or type custom text */}
                       {templateVars.length > 0 && (
@@ -1344,11 +1533,12 @@ export default function BulkMessagePage({ onNavigate }) {
                 </button>
                 <button
                   onClick={() => handleNewBroadcastSave('SENT')}
-                  disabled={isBroadcastFormInvalid()}
+                  disabled={isBroadcastSendInvalid()}
+                  title={headerMediaType && !newBroadcastMediaLibraryId ? `Pick the header ${headerMediaType} first` : undefined}
                   style={{
                     padding: '10px 18px', borderRadius: 8, border: 'none',
-                    background: isBroadcastFormInvalid() ? '#ccc' : C.primary,
-                    color: '#fff', cursor: isBroadcastFormInvalid() ? 'not-allowed' : 'pointer',
+                    background: isBroadcastSendInvalid() ? '#ccc' : C.primary,
+                    color: '#fff', cursor: isBroadcastSendInvalid() ? 'not-allowed' : 'pointer',
                     fontSize: 13, fontWeight: 700, fontFamily: FONT,
                     display: 'flex', alignItems: 'center', gap: 6,
                   }}
@@ -1417,7 +1607,36 @@ export default function BulkMessagePage({ onNavigate }) {
       ) : (
         <>
           {/* KPI Cards */}
-          <KpiCards metrics={metrics} />
+          <KpiCards metrics={metrics} onFailedClick={handleFailedKpiClick} />
+
+          {/* Campaign Timing */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16,
+            background: C.cardBg, borderRadius: 12, border: `1px solid ${C.border}`,
+            padding: '16px 20px', marginBottom: 24,
+          }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textSecondary, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Campaign Started</div>
+              <div style={{ fontSize: 13, color: C.text, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Clock size={12} color={C.textMuted} />
+                {metrics.startedAt ? `${formatDate(metrics.startedAt)} ${formatTime(metrics.startedAt)}` : '—'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textSecondary, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Campaign Completed</div>
+              <div style={{ fontSize: 13, color: b.completed_at ? C.text : '#2563eb', display: 'flex', alignItems: 'center', gap: 6 }}>
+                {b.completed_at
+                  ? <><CheckCircle size={12} color={C.textMuted} /> {formatDate(b.completed_at)} {formatTime(b.completed_at)}</>
+                  : metrics.startedAt ? <><Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> In progress…</> : '—'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.textSecondary, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Duration</div>
+              <div style={{ fontSize: 13, color: C.text }}>
+                {formatDuration(metrics.startedAt, b.completed_at) || '—'}
+              </div>
+            </div>
+          </div>
 
           {/* Info + Preview Grid */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 380px', gap: 24, marginBottom: 28 }}>
@@ -1510,6 +1729,140 @@ export default function BulkMessagePage({ onNavigate }) {
                 </tbody>
               </table>
             )}
+          </div>
+
+          {/* Recipients List (per-contact delivery) */}
+          <div ref={recipientsSectionRef} style={{ background: C.cardBg, borderRadius: 12, border: `1px solid ${C.border}`, overflow: 'hidden', marginTop: 24 }}>
+            <div style={{ padding: '16px 20px', borderBottom: `1px solid ${C.border}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>Recipients</div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {RECIPIENT_FILTER_TABS.map(tab => {
+                    const active = recipientFilter === tab.key;
+                    const count = tab.key === 'all' ? recipients.length
+                      : tab.key === 'delivered' ? recipients.filter(r => r.status === 'delivered' || r.status === 'read').length
+                      : recipients.filter(r => r.status === tab.key).length;
+                    return (
+                      <button
+                        key={tab.key}
+                        onClick={() => setRecipientFilter(tab.key)}
+                        style={{
+                          padding: '5px 12px', borderRadius: 8, border: `1.5px solid ${active ? C.primary : C.border}`,
+                          background: active ? C.primary : 'var(--c-cardBg)', color: active ? '#fff' : C.textSecondary,
+                          cursor: 'pointer', fontSize: 12, fontWeight: 700, fontFamily: FONT,
+                        }}
+                      >
+                        {tab.label} ({count})
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {recipients.some(r => r.status === 'failed') && (
+                  <button
+                    onClick={handleRetryAllFailed}
+                    disabled={retryingAll}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      padding: '7px 12px', borderRadius: 8, border: `1.5px solid ${C.primary}`,
+                      background: 'var(--c-cardBg)', color: C.primary,
+                      cursor: retryingAll ? 'not-allowed' : 'pointer', fontSize: 12, fontWeight: 700, fontFamily: FONT,
+                      opacity: retryingAll ? 0.6 : 1,
+                    }}
+                  >
+                    {retryingAll ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <RotateCcw size={13} />}
+                    Retry all failed
+                  </button>
+                )}
+                <button
+                  onClick={() => exportRecipientsCsv(recipients.filter(r => {
+                    if (recipientFilter === 'all') return true;
+                    if (recipientFilter === 'delivered') return r.status === 'delivered' || r.status === 'read';
+                    return r.status === recipientFilter;
+                  }))}
+                  disabled={recipients.length === 0}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 6,
+                    padding: '7px 12px', borderRadius: 8, border: `1px solid ${C.border}`,
+                    background: 'var(--c-cardBg)', color: C.textSecondary,
+                    cursor: recipients.length === 0 ? 'not-allowed' : 'pointer', fontSize: 12, fontWeight: 700, fontFamily: FONT,
+                    opacity: recipients.length === 0 ? 0.5 : 1,
+                  }}
+                >
+                  <Download size={13} /> Export CSV
+                </button>
+              </div>
+            </div>
+
+            {(() => {
+              const filteredRecipients = recipients.filter(r => {
+                if (recipientFilter === 'all') return true;
+                if (recipientFilter === 'delivered') return r.status === 'delivered' || r.status === 'read';
+                return r.status === recipientFilter;
+              });
+              if (recipientsLoading && recipients.length === 0) {
+                return (
+                  <div style={{ padding: 40, textAlign: 'center', color: C.textMuted }}>
+                    <Loader2 size={20} style={{ animation: 'spin 1s linear infinite', marginBottom: 8 }} />
+                    <div style={{ fontSize: 13 }}>Loading recipients…</div>
+                  </div>
+                );
+              }
+              if (filteredRecipients.length === 0) {
+                return (
+                  <div style={{ padding: 40, textAlign: 'center', fontSize: 13, color: C.textMuted }}>
+                    {recipients.length === 0 ? 'No recipients yet — send a broadcast to see them here.' : 'No recipients match this filter.'}
+                  </div>
+                );
+              }
+              return (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <thead>
+                    <tr style={{ background: '#fafaf9', borderBottom: `1px solid ${C.border}` }}>
+                      <th style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Name</th>
+                      <th style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Number</th>
+                      <th style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Status</th>
+                      <th style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Time</th>
+                      <th style={{ padding: '10px 16px', textAlign: 'right', fontSize: 11, fontWeight: 700, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredRecipients.map(r => (
+                      <tr key={r.logId} style={{ borderBottom: `1px solid ${C.border}` }}>
+                        <td style={{ padding: '10px 16px', fontWeight: 600, color: C.text }}>{r.name || '—'}</td>
+                        <td style={{ padding: '10px 16px', color: C.textSecondary }}><MaskedNumber number={r.contactNumber} prefix="+" /></td>
+                        <td style={{ padding: '10px 16px' }}>
+                          <RecipientStatusBadge status={r.status} />
+                          {r.status === 'failed' && r.errorMessage && (
+                            <div style={{ fontSize: 11, color: '#991b1b', marginTop: 3, maxWidth: 260 }}>{r.errorMessage}</div>
+                          )}
+                        </td>
+                        <td style={{ padding: '10px 16px', color: C.textSecondary, fontSize: 12 }}>
+                          {r.sentAt ? `${formatDate(r.sentAt)} ${formatTime(r.sentAt)}` : '—'}
+                        </td>
+                        <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                          {r.status === 'failed' && (
+                            <button
+                              onClick={() => handleRetryRecipient(r.logId)}
+                              disabled={retryingLogId === r.logId}
+                              style={{
+                                display: 'inline-flex', alignItems: 'center', gap: 4,
+                                border: 'none', background: 'transparent', cursor: retryingLogId === r.logId ? 'not-allowed' : 'pointer',
+                                color: C.primary, fontSize: 12, fontWeight: 700, fontFamily: FONT,
+                              }}
+                            >
+                              {retryingLogId === r.logId ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <RotateCcw size={13} />}
+                              Retry
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              );
+            })()}
           </div>
         </>
       )}
