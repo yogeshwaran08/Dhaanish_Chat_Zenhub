@@ -34,6 +34,13 @@ services:
     restart: unless-stopped
     env_file:
       - ./backend/.env
+    environment:
+      # The boot-time migration runner needs the .sql files on disk. They can't
+      # be baked into the image (the build context is ./backend, and db/ sits
+      # above it), so they're bind-mounted below. Without this the runner logs
+      # "migrations directory not found — skipping" and boots against an
+      # un-migrated schema, which surfaces later as `column ... does not exist`.
+      MIGRATIONS_DIR: /app/db/migrations
     depends_on:
       postgres:
         condition: service_started
@@ -42,6 +49,7 @@ services:
     volumes:
       - backend_uploads:/app/uploads
       - backend_media:/app/media
+      - ./db/migrations:/app/db/migrations:ro
     networks:
       - forgecrm
 
